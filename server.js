@@ -26,6 +26,8 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
+// ============ AUTH ROUTES ============
+
 app.post('/api/auth/signup', async (req, res) => {
   const { name, email, password } = req.body
 
@@ -87,7 +89,8 @@ app.post('/api/auth/login', async (req, res) => {
   }
 })
 
-// GET all subjects — only the logged-in student's own
+// ============ SUBJECT ROUTES ============
+
 app.get('/api/subjects', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -101,13 +104,24 @@ app.get('/api/subjects', requireAuth, async (req, res) => {
   }
 })
 
-// POST a new subject — tied to the logged-in student
 app.post('/api/subjects', requireAuth, async (req, res) => {
-  const { name, attended, total, is_complete = false } = req.body
+  const { name, required_percentage } = req.body
+
+  if (!name || name.trim() === '') {
+    return res.status(400).json({ error: 'Subject name is required' })
+  }
+  if (
+    required_percentage === undefined ||
+    required_percentage < 0 ||
+    required_percentage > 100
+  ) {
+    return res.status(400).json({ error: 'Required percentage must be between 0 and 100' })
+  }
+
   try {
     const result = await pool.query(
-      'INSERT INTO subjects (student_id, name, attended, total, is_complete) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.studentId, name, attended, total, is_complete]
+      'INSERT INTO subjects (student_id, name, required_percentage) VALUES ($1, $2, $3) RETURNING *',
+      [req.studentId, name, required_percentage]
     )
     res.status(201).json(result.rows[0])
   } catch (err) {
@@ -116,14 +130,18 @@ app.post('/api/subjects', requireAuth, async (req, res) => {
   }
 })
 
-// PUT (update) — only if it belongs to the logged-in student
 app.put('/api/subjects/:id', requireAuth, async (req, res) => {
   const { id } = req.params
-  const { name, attended, total, is_complete } = req.body
+  const { name, required_percentage, is_semester_complete } = req.body
   try {
     const result = await pool.query(
-      'UPDATE subjects SET name = $1, attended = $2, total = $3, is_complete = $4 WHERE id = $5 AND student_id = $6 RETURNING *',
-      [name, attended, total, is_complete, id, req.studentId]
+      `UPDATE subjects
+       SET name = COALESCE($1, name),
+           required_percentage = COALESCE($2, required_percentage),
+           is_semester_complete = COALESCE($3, is_semester_complete)
+       WHERE id = $4 AND student_id = $5
+       RETURNING *`,
+      [name, required_percentage, is_semester_complete, id, req.studentId]
     )
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Subject not found' })
@@ -135,7 +153,6 @@ app.put('/api/subjects/:id', requireAuth, async (req, res) => {
   }
 })
 
-// DELETE — only if it belongs to the logged-in student
 app.delete('/api/subjects/:id', requireAuth, async (req, res) => {
   const { id } = req.params
   try {
@@ -153,7 +170,207 @@ app.delete('/api/subjects/:id', requireAuth, async (req, res) => {
   }
 })
 
-const PORT = 3001
+// ============ ATTENDANCE LOG ROUTES ============
+
+// Log or update a day's status
+app.post('/api/subjects/:id/log', requireAuth, async (req, res) => {
+  const { id } = req.params
+  const { log_date, status } = req.body
+
+  if (!log_date || !['present', 'absent', 'no_class'].includes(status)) {
+    return res.status(400).json({ error: 'A valid date and status are required' })
+  }
+
+  try {
+    const subjectCheck = await pool.query(
+      'SELECT * FROM subjects WHERE id = $1 AND student_id = $2',
+      [id, req.studentId]
+    )
+    if (subjectCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Subject not found' })
+    }
+    if (subjectCheck.rows[0].is_semester_complete) {
+      return res.status(400).json({ error: 'Semester is marked complete — reopen it before logging' })
+    }
+
+    const result = await pool.query(
+      `INSERT INTO attendance_log (subject_id, log_date, status)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (subject_id, log_date)
+       DO UPDATE SET status = EXCLUDED.status
+       RETURNING *`,
+      [id, log_date, status]
+    )
+    res.status(201).json(result.rows[0])
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to log attendance' })
+  }
+})
+
+// Get full attendance history for a subject
+app.get('/api/subjects/:id/log', requireAuth, async (req, res) => {
+  const { id } = req.params
+  try {
+    const subjectCheck = await pool.query(
+      'SELECT * FROM subjects WHERE id = $1 AND student_id = $2',
+      [id, req.studentId]
+    )
+    if (subjectCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Subject not found' })
+    }
+
+    const result = await pool.query(
+      'SELECT * FROM attendance_log WHERE subject_id = $1 ORDER BY log_date ASC',
+      [id]
+    )
+    res.json(result.rows)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch attendance history' })
+  }
+})
+
+// Edit a specific past entry
+app.put('/api/subjects/:id/log/:logId', requireAuth, async (req, res) => {
+  const { id, logId } = req.params
+  const { status } = req.body
+
+  if (!['present', 'absent', 'no_class'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' })
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE attendance_log SET status = $1
+       WHERE id = $2 AND subject_id = $3
+       AND subject_id IN (SELECT id FROM subjects WHERE student_id = $4)
+       RETURNING *`,
+      [status, logId, id, req.studentId]
+    )
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Entry not found' })
+    }
+    res.json(result.rows[0])
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to update entry' })
+  }
+})
+
+// Delete a specific past entry
+app.delete('/api/subjects/:id/log/:logId', requireAuth, async (req, res) => {
+  const { id, logId } = req.params
+  try {
+    const result = await pool.query(
+      `DELETE FROM attendance_log
+       WHERE id = $1 AND subject_id = $2
+       AND subject_id IN (SELECT id FROM subjects WHERE student_id = $3)
+       RETURNING *`,
+      [logId, id, req.studentId]
+    )
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Entry not found' })
+    }
+    res.json({ message: 'Entry deleted' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to delete entry' })
+  }
+})
+
+// ============ CALCULATION / REPORT ROUTE ============
+
+app.get('/api/subjects/:id/report', requireAuth, async (req, res) => {
+  const { id } = req.params
+
+  try {
+    const subjectResult = await pool.query(
+      'SELECT * FROM subjects WHERE id = $1 AND student_id = $2',
+      [id, req.studentId]
+    )
+    if (subjectResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Subject not found' })
+    }
+    const subject = subjectResult.rows[0]
+
+    const logResult = await pool.query(
+      'SELECT status FROM attendance_log WHERE subject_id = $1',
+      [id]
+    )
+    const entries = logResult.rows
+
+    const present = entries.filter((e) => e.status === 'present').length
+    const absent = entries.filter((e) => e.status === 'absent').length
+    const total = present + absent // 'no_class' entries never count
+
+    const currentPercent = total === 0 ? null : (present / total) * 100
+    const requiredPercent = subject.required_percentage
+
+    // If semester is complete, this is a final, locked report — no simulation needed
+    if (subject.is_semester_complete) {
+      return res.json({
+        subject: subject.name,
+        requiredPercent,
+        present,
+        absent,
+        total,
+        currentPercent,
+        isComplete: true,
+        recommendation: null,
+      })
+    }
+
+    // No classes logged yet at all
+    if (total === 0) {
+      return res.json({
+        subject: subject.name,
+        requiredPercent,
+        present,
+        absent,
+        total,
+        currentPercent: null,
+        isComplete: false,
+        recommendation: 'No attendance available. Waiting for the first class.',
+      })
+    }
+
+    // Simulate today's class both ways
+    const ifPresentPercent = (present + 1) / (total + 1) * 100
+    const ifAbsentPercent = present / (total + 1) * 100
+
+    const canBunk = ifAbsentPercent >= requiredPercent
+
+    let status
+    if (currentPercent === 100) status = 'excellent'
+    else if (currentPercent >= requiredPercent && canBunk) status = 'safe'
+    else if (currentPercent >= requiredPercent && !canBunk) status = 'borderline'
+    else status = 'danger'
+
+    const recommendation = canBunk
+      ? "You may bunk today's class."
+      : "Attend today's class."
+
+    res.json({
+      subject: subject.name,
+      requiredPercent,
+      present,
+      absent,
+      total,
+      currentPercent,
+      ifPresentPercent,
+      ifAbsentPercent,
+      status,
+      recommendation,
+      isComplete: false,
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to generate report' })
+  }
+})
+
+const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`)
+  console.log(`Server running on port ${PORT}`)
 })
